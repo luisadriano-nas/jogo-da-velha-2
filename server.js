@@ -5,13 +5,11 @@ const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*' }
-});
+const io = new Server(server, { cors: { origin: '*' } });
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Rooms: { roomCode: { players: [{id, name, symbol}], state: {...} } }
+// rooms: { code: { players, state, chat, cleanupTimer } }
 const rooms = {};
 
 function createGameState() {
@@ -37,42 +35,63 @@ function checkWinner(board) {
   return null;
 }
 
+function getRoomForSocket(socketId) {
+  for (const [code, room] of Object.entries(rooms)) {
+    if (room.players.some(p => p.id === socketId)) return { code, room };
+  }
+  return null;
+}
+
 io.on('connection', (socket) => {
   console.log('Conectado:', socket.id);
 
-  // Create room
+  // ---- CREATE ROOM ----
   socket.on('create_room', ({ playerName }) => {
     let code;
     do { code = generateCode(); } while (rooms[code]);
 
     rooms[code] = {
-      players: [{ id: socket.id, name: playerName || 'Jogador X', symbol: 'X' }],
+      players: [{ id: socket.id, name: playerName || 'Jogador X', symbol: 'X', connected: true }],
       state: createGameState(),
+      chat: [],
+      cleanupTimer: null,
+      score: { X: 0, O: 0, draw: 0 },
       rematch: {}
     };
 
     socket.join(code);
     socket.roomCode = code;
     socket.symbol = 'X';
-
-    socket.emit('room_created', { code, symbol: 'X', playerName: playerName || 'Jogador X' });
+    socket.emit('room_created', { code, symbol: 'X' });
     console.log(`Sala criada: ${code}`);
   });
 
-  // Join room
+  // ---- JOIN ROOM ----
   socket.on('join_room', ({ code, playerName }) => {
     const room = rooms[code];
+    if (!room) { socket.emit('error', { message: 'Sala não encontrada. Verifique o código.' }); return; }
 
-    if (!room) {
-      socket.emit('error', { message: 'Sala não encontrada. Verifique o código.' });
+    // Check if this is a reconnection (same name/symbol slot)
+    const existingO = room.players.find(p => p.symbol === 'O');
+    if (existingO && !existingO.connected) {
+      // Reconnect as O
+      existingO.id = socket.id;
+      existingO.connected = true;
+      if (room.cleanupTimer) { clearTimeout(room.cleanupTimer); room.cleanupTimer = null; }
+      socket.join(code);
+      socket.roomCode = code;
+      socket.symbol = 'O';
+      socket.emit('game_start', { symbol: 'O', opponentName: room.players[0].name, state: room.state, score: room.score, chat: room.chat });
+      io.to(room.players[0].id).emit('opponent_reconnected', { name: existingO.name });
+      console.log(`Reconectado como O na sala ${code}`);
       return;
     }
-    if (room.players.length >= 2) {
-      socket.emit('error', { message: 'Sala cheia!' });
-      return;
-    }
 
-    room.players.push({ id: socket.id, name: playerName || 'Jogador O', symbol: 'O' });
+    if (room.players.length >= 2) { socket.emit('error', { message: 'Sala cheia!' }); return; }
+
+    room.players.push({ id: socket.id, name: playerName || 'Jogador O', symbol: 'O', connected: true });
+    if (room.cleanupTimer) { clearTimeout(room.cleanupTimer); room.cleanupTimer = null; }
+
     socket.join(code);
     socket.roomCode = code;
     socket.symbol = 'O';
@@ -80,95 +99,144 @@ io.on('connection', (socket) => {
     const xPlayer = room.players[0];
     const oPlayer = room.players[1];
 
-    // Notify both players
-    socket.emit('game_start', {
-      symbol: 'O',
-      opponentName: xPlayer.name,
-      state: room.state
-    });
-
-    io.to(xPlayer.id).emit('game_start', {
-      symbol: 'X',
-      opponentName: oPlayer.name,
-      state: room.state
-    });
-
-    console.log(`Sala ${code} iniciou com 2 jogadores`);
+    socket.emit('game_start', { symbol: 'O', opponentName: xPlayer.name, state: room.state, score: room.score, chat: room.chat });
+    io.to(xPlayer.id).emit('game_start', { symbol: 'X', opponentName: oPlayer.name, state: room.state, score: room.score, chat: room.chat });
+    console.log(`Sala ${code} iniciada`);
   });
 
-  // Play move
+  // ---- RECONNECT (player returning to tab) ----
+  socket.on('reconnect_room', ({ code, symbol, playerName }) => {
+    const room = rooms[code];
+    if (!room) { socket.emit('error', { message: 'Sala expirou. Crie uma nova.' }); return; }
+
+    const player = room.players.find(p => p.symbol === symbol);
+    if (!player) { socket.emit('error', { message: 'Slot não encontrado.' }); return; }
+
+    // Update socket id
+    player.id = socket.id;
+    player.connected = true;
+    if (room.cleanupTimer) { clearTimeout(room.cleanupTimer); room.cleanupTimer = null; }
+
+    socket.join(code);
+    socket.roomCode = code;
+    socket.symbol = symbol;
+
+    const opponent = room.players.find(p => p.symbol !== symbol);
+
+    socket.emit('reconnect_success', {
+      symbol,
+      opponentName: opponent ? opponent.name : '',
+      opponentConnected: opponent ? opponent.connected : false,
+      state: room.state,
+      score: room.score,
+      chat: room.chat
+    });
+
+    if (opponent && opponent.connected) {
+      io.to(opponent.id).emit('opponent_reconnected', { name: player.name });
+    }
+
+    console.log(`${symbol} reconectou na sala ${code}`);
+  });
+
+  // ---- PLAY MOVE ----
   socket.on('play_move', ({ sb, ci }) => {
     const code = socket.roomCode;
     const room = rooms[code];
     if (!room) return;
 
     const state = room.state;
-    const { cells, smallWinners, currentPlayer, activeSmall } = state;
-
-    // Validate it's this player's turn
-    if (socket.symbol !== currentPlayer) return;
+    if (socket.symbol !== state.currentPlayer) return;
     if (state.bigWinner) return;
-    if (cells[sb][ci] !== null || smallWinners[sb] !== null) return;
-    if (activeSmall !== null && activeSmall !== sb) return;
+    if (state.cells[sb][ci] !== null || state.smallWinners[sb] !== null) return;
+    if (state.activeSmall !== null && state.activeSmall !== sb) return;
 
-    // Apply move
-    cells[sb][ci] = currentPlayer;
+    state.cells[sb][ci] = state.currentPlayer;
 
-    const sw = checkWinner(cells[sb]);
-    if (sw) smallWinners[sb] = sw;
+    const sw = checkWinner(state.cells[sb]);
+    if (sw) state.smallWinners[sb] = sw;
 
-    const bw = checkWinner(smallWinners);
+    const bw = checkWinner(state.smallWinners);
     if (bw && bw !== 'draw') {
       state.bigWinner = bw;
-    } else if (smallWinners.every(s => s !== null)) {
+      room.score[bw]++;
+    } else if (state.smallWinners.every(s => s !== null)) {
       state.bigWinner = 'draw';
+      room.score.draw++;
     } else {
-      state.activeSmall = smallWinners[ci] !== null ? null : ci;
-      state.currentPlayer = currentPlayer === 'X' ? 'O' : 'X';
+      state.activeSmall = state.smallWinners[ci] !== null ? null : ci;
+      state.currentPlayer = state.currentPlayer === 'X' ? 'O' : 'X';
     }
 
-    io.to(code).emit('state_update', { state });
+    io.to(code).emit('state_update', { state, score: room.score });
   });
 
-  // Rematch request
+  // ---- CHAT ----
+  socket.on('chat_message', ({ text }) => {
+    const code = socket.roomCode;
+    const room = rooms[code];
+    if (!room || !text || text.trim().length === 0) return;
+
+    const player = room.players.find(p => p.id === socket.id);
+    if (!player) return;
+
+    const msg = {
+      symbol: player.symbol,
+      name: player.name,
+      text: text.trim().substring(0, 200),
+      time: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
+    };
+
+    // Keep last 100 messages
+    room.chat.push(msg);
+    if (room.chat.length > 100) room.chat.shift();
+
+    io.to(code).emit('chat_message', msg);
+  });
+
+  // ---- REMATCH ----
   socket.on('request_rematch', () => {
     const code = socket.roomCode;
     const room = rooms[code];
     if (!room) return;
 
     room.rematch[socket.id] = true;
-
-    // If both want rematch
     if (room.players.length === 2 && room.players.every(p => room.rematch[p.id])) {
       room.state = createGameState();
       room.rematch = {};
       io.to(code).emit('rematch_start', { state: room.state });
     } else {
-      // Notify opponent
       const opponent = room.players.find(p => p.id !== socket.id);
-      if (opponent) io.to(opponent.id).emit('rematch_requested');
+      if (opponent && opponent.connected) io.to(opponent.id).emit('rematch_requested');
     }
   });
 
-  // Disconnect
+  // ---- DISCONNECT ----
   socket.on('disconnect', () => {
     const code = socket.roomCode;
     if (!code || !rooms[code]) return;
 
     const room = rooms[code];
-    room.players = room.players.filter(p => p.id !== socket.id);
-
-    if (room.players.length === 0) {
-      delete rooms[code];
-      console.log(`Sala ${code} removida`);
-    } else {
-      io.to(code).emit('opponent_disconnected');
-      console.log(`Jogador saiu da sala ${code}`);
+    const player = room.players.find(p => p.id === socket.id);
+    if (player) {
+      player.connected = false;
+      console.log(`${player.symbol} desconectou da sala ${code}`);
     }
+
+    const opponent = room.players.find(p => p.id !== socket.id);
+    if (opponent && opponent.connected) {
+      io.to(opponent.id).emit('opponent_disconnected_temp');
+    }
+
+    // Give 3 minutes for reconnection before destroying room
+    room.cleanupTimer = setTimeout(() => {
+      if (rooms[code] && room.players.every(p => !p.connected)) {
+        delete rooms[code];
+        console.log(`Sala ${code} removida por inatividade`);
+      }
+    }, 3 * 60 * 1000);
   });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Servidor na porta ${PORT}`));
