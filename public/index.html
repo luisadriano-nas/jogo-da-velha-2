@@ -636,7 +636,7 @@ function connectSocket(){
   socket.on('opponent_reconnected',({name})=>{document.getElementById('tt').textContent=name+' voltou!';setTimeout(render,1500);});
   socket.on('opponent_disconnected_temp',()=>{document.getElementById('tt').textContent='Adversário desconectou. Aguardando 3 min...';document.getElementById('bh').textContent='A partida continua quando ele voltar';});
   socket.on('rematch_requested',()=>{document.getElementById('rematchStatus').textContent='Adversário quer revanche! Clique em Revanche para aceitar.';});
-  socket.on('rematch_start',({state})=>{rematchRequested=false;document.getElementById('rematchStatus').textContent='';closeW();applyState(state);render();});
+  socket.on('rematch_start',({state})=>{rematchRequested=false;document.getElementById('rematchStatus').textContent='';closeW();document.getElementById('winLineSvg').innerHTML='';applyState(state);render();});
   socket.on('error',({message})=>{document.getElementById('reconBanner').classList.remove('show');showErr(message);});
 }
 
